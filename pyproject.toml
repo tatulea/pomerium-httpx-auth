@@ -1,0 +1,25 @@
+[project]
+name = "pomerium-httpx-auth"
+version = "0.1.0"
+description = "HTTPX authentication helper for Pomerium-protected services"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Gabriel Arnautu" }
+]
+requires-python = ">=3.10"
+dependencies = ["httpx[http2]"]
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio"]
+
+[project.scripts]
+pomerium-httpx-auth = "pomerium_httpx_auth.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["uv_build>=0.8.22,<0.9.0"]
+build-backend = "uv_build"
