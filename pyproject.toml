@@ -1,6 +1,6 @@
 [project]
 name = "pomerium-httpx-auth"
-version = "0.1.0"
+version = "0.2.0"
 description = "HTTPX authentication helper for Pomerium-protected services"
 readme = "README.md"
 license = { file = "LICENSE" }
