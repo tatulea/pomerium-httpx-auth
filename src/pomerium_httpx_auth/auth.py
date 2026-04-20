@@ -21,7 +21,6 @@ import http.server
 _LOG = logging.getLogger("pomerium_httpx_auth")
 
 _CALLBACK_HOST = "127.0.0.1"
-_TIME_DRIFT_SECONDS = 60
 _DEFAULT_CALLBACK_TIMEOUT_SECONDS = 300
 
 
@@ -32,7 +31,6 @@ class PomeriumAuthError(RuntimeError):
 @dataclass
 class _TokenEntry:
     jwt: str
-    expiry: int
 
 
 class _TokenCache:
@@ -43,35 +41,24 @@ class _TokenCache:
 
     def get(self, host: str) -> Optional[str]:
         entry = self._memory.get(host)
-        if entry and self._is_valid(entry.expiry):
+        if entry:
             return entry.jwt
-
-        if entry and not self._is_valid(entry.expiry):
-            self._memory.pop(host, None)
 
         if not self._enabled or not self._cache_dir:
             return None
 
         disk_entry = self._load_from_disk(host)
-        if disk_entry and self._is_valid(disk_entry.expiry):
+        if disk_entry:
             self._memory[host] = disk_entry
             return disk_entry.jwt
-
-        if disk_entry and not self._is_valid(disk_entry.expiry):
-            self._delete_from_disk(host)
 
         return None
 
     def set(self, host: str, jwt: str) -> None:
-        expiry = _parse_jwt_exp(jwt)
-        entry = _TokenEntry(jwt=jwt, expiry=expiry)
+        entry = _TokenEntry(jwt=jwt)
         self._memory[host] = entry
         if self._enabled and self._cache_dir:
             self._store_to_disk(host, entry)
-
-    @staticmethod
-    def _is_valid(expiry: int) -> bool:
-        return expiry > int(time.time() + _TIME_DRIFT_SECONDS)
 
     @staticmethod
     def _init_cache_dir(cache_dir: Optional[Path]) -> Path:
@@ -97,14 +84,13 @@ class _TokenCache:
         except (OSError, json.JSONDecodeError):
             return None
         jwt = data.get("jwt")
-        expiry = data.get("expiry")
-        if not isinstance(jwt, str) or not isinstance(expiry, int):
+        if not isinstance(jwt, str):
             return None
-        return _TokenEntry(jwt=jwt, expiry=expiry)
+        return _TokenEntry(jwt=jwt)
 
     def _store_to_disk(self, host: str, entry: _TokenEntry) -> None:
         path = self._cache_path(host)
-        payload = {"host": host, "expiry": entry.expiry, "jwt": entry.jwt}
+        payload = {"host": host, "jwt": entry.jwt}
         try:
             tmp_path = path.with_suffix(".tmp")
             tmp_path.write_text(json.dumps(payload, indent=2))
@@ -119,13 +105,6 @@ class _TokenCache:
                 pass
         except OSError as exc:
             raise PomeriumAuthError(f"Failed to store JWT cache: {exc}") from exc
-
-    def _delete_from_disk(self, host: str) -> None:
-        path = self._cache_path(host)
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            return
 
 
 class _CallbackServer(http.server.HTTPServer):
@@ -196,7 +175,7 @@ class PomeriumAuth(httpx.Auth):
         request.headers["Authorization"] = f"Pomerium {token}"
         response = yield request
 
-        if _is_sign_in_redirect(response):
+        if _needs_reauthentication(response):
             token = self._refresh_token_sync(request.url)
             new_request = _clone_request(request, body)
             new_request.headers["Authorization"] = f"Pomerium {token}"
@@ -212,7 +191,7 @@ class PomeriumAuth(httpx.Auth):
         request.headers["Authorization"] = f"Pomerium {token}"
         response = yield request
 
-        if _is_sign_in_redirect(response):
+        if _needs_reauthentication(response):
             token = await self._refresh_token_async(request.url)
             new_request = _clone_request(request, body)
             new_request.headers["Authorization"] = f"Pomerium {token}"
@@ -377,26 +356,6 @@ def _require_host(url: httpx.URL) -> str:
     return host
 
 
-def _parse_jwt_exp(jwt: str) -> int:
-    parts = jwt.split(".")
-    if len(parts) != 3:
-        raise PomeriumAuthError("Invalid JWT format")
-    payload = parts[1]
-    payload += "=" * (-len(payload) % 4)
-    try:
-        decoded = base64.urlsafe_b64decode(payload.encode("utf-8"))
-        data = json.loads(decoded.decode("utf-8"))
-    except (ValueError, json.JSONDecodeError) as exc:
-        raise PomeriumAuthError("Failed to decode JWT payload") from exc
-    exp = data.get("exp")
-    if exp is None:
-        return int(time.time() + 3600)
-    try:
-        return int(exp)
-    except (TypeError, ValueError) as exc:
-        raise PomeriumAuthError("Invalid exp claim in JWT") from exc
-
-
 def _host_cache_key(host: str) -> str:
     encoded = base64.urlsafe_b64encode(host.encode("utf-8")).decode("ascii")
     return encoded.rstrip("=")
@@ -413,7 +372,9 @@ def _default_cache_dir() -> Path:
     return base / "pomerium-httpx-auth"
 
 
-def _is_sign_in_redirect(response: httpx.Response) -> bool:
+def _needs_reauthentication(response: httpx.Response) -> bool:
+    if response.status_code == 401:
+        return True
     locations: list[str] = []
     if response.is_redirect:
         location = response.headers.get("location")
